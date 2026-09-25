@@ -48,21 +48,27 @@ class Gateway:
             return IngestResult(accepted=False, rejection=normalized)
         point = normalized
 
-        reason = self._sessions.check(point)
-        if reason is not None:
-            rej = Rejection(reason=reason, envelope=envelope,
-                            detail=f"device={point.device_id} seq={point.seq}")
-            logger.info("reject %s: %s", rej.reason.value, rej.detail)
-            return IngestResult(accepted=False, rejection=rej)
-
-        stored = self._buffer.store(point)
-        if stored is StoreResult.DUPLICATE:
+        # 重复投递（内容完全相同，含已确认的历史报文）幂等接受，先于序列检查：
+        # 上游重发旧报文不应计为序列回退，也不应重复补发。
+        if self._buffer.is_duplicate(point):
             logger.info("duplicate device=%s metric=%s seq=%s (idempotent accept)",
                         point.device_id, point.metric, point.seq)
             return IngestResult(accepted=True, point=point, duplicate=True)
+
+        # 先入缓存再做会话/配额判定，保证补发 offset 等于接收顺序；
+        # 判定拒绝则回滚（offset 空洞不影响后续记录的顺序）。
+        stored = self._buffer.store(point)
         if stored is StoreResult.FULL:
             rej = Rejection(reason=RejectReason.BUFFER_FULL, envelope=envelope,
                             detail=f"buffer capacity {self._buffer.capacity} exhausted")
+            logger.info("reject %s: %s", rej.reason.value, rej.detail)
+            return IngestResult(accepted=False, rejection=rej)
+
+        reason = self._sessions.check(point)
+        if reason is not None:
+            self._buffer.rollback_last(point)
+            rej = Rejection(reason=reason, envelope=envelope,
+                            detail=f"device={point.device_id} seq={point.seq}")
             logger.info("reject %s: %s", rej.reason.value, rej.detail)
             return IngestResult(accepted=False, rejection=rej)
 
