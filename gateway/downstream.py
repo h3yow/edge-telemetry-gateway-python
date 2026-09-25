@@ -1,4 +1,4 @@
-"""下游抽象与本地可复现的故障注入下游（骨架）。"""
+"""下游抽象与本地可复现的故障注入下游。"""
 from __future__ import annotations
 
 from typing import Protocol
@@ -22,11 +22,14 @@ class SimulatedDownstream:
         self.received: list[BufferedRecord] = []
 
     def set_up(self, up: bool) -> None:
-        raise NotImplementedError
+        self._up = up
 
     @property
     def is_up(self) -> bool:
-        raise NotImplementedError
+        return self._up
 
     def send(self, record: BufferedRecord) -> bool:
-        raise NotImplementedError
+        if not self._up:
+            return False
+        self.received.append(record)
+        return True
