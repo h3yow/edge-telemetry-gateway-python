@@ -13,12 +13,14 @@
 | --- | --- |
 | `gateway/models.py` | 统一内部模型 `TelemetryPoint`、原始报文 `RawEnvelope`、拒绝原因 `RejectReason`、判定结果 `IngestResult` |
 | `gateway/normalizer.py` | 协议归一（来源适配器），字段/时间戳/来源校验 |
-| `gateway/session.py` | 设备会话、并发连接配额、滑窗频率配额、序列连续性检查、配额版本化 |
-| `gateway/buffer.py` | 有界本地缓存：容量上限、内容去重、单调 offset、确认截断 |
+| `gateway/config.py` | 按设备配置治理：差异化配置、整批校验热更新、有界版本历史 |
+| `gateway/session.py` | 设备会话、并发连接配额、滑窗频率配额、序列连续性检查（按设备生效配置判定） |
+| `gateway/buffer.py` | 有界本地缓存：容量上限、内容去重、单调 offset、确认截断；记录受理时配置版本 |
+| `gateway/audit.py` | 判定台账（有界、可查询）与确定性重放 |
 | `gateway/downstream.py` | 下游协议与本地故障注入实现 |
-| `gateway/gateway.py` | 编排：归一 → 去重/缓存 → 会话配额 → 转发/补发 |
+| `gateway/gateway.py` | 编排：归一 → 去重/缓存 → 会话配额 → 转发/补发；判定/会话/补发事件入台账 |
 | `main.py` | FastAPI HTTP 入口（本地运行） |
-| `tests/` | 25 项单元/集成测试 |
+| `tests/` | 33 项单元/集成测试 |
 
 ## 接入协议
 
@@ -95,6 +97,77 @@ TelemetryPoint(device_id, metric, value, ts_ms, seq, source, received_at_ms)
   （`last_seq`，设备固有状态）保留，频率窗口计数在新版本下重新起算；
   历史判定发生时的策略版本记录在会话状态上，历史数据语义可复现。
 
+## 配置治理与判定可追溯
+
+### 按设备配置与热更新
+
+- 配置由 `ConfigRegistry` 管理：一份**默认配置**（`device_id=null`）+ 任意多份
+  **设备覆盖**。未覆盖的设备回落默认配置；覆盖只影响目标设备，其他设备的
+  会话、窗口、判定完全不受影响。
+- 每台设备的配置是一条独立版本链，`version` 单调递增（设备首次覆盖自成一链，
+  与默认链版本无关）。
+- 更新按批提交（`POST /config`）：**先整批校验、后整批生效**。任一更新字段非法
+  （配额/窗口 < 1）或版本不前进（持平/回退），整批拒绝并返回全部错误，
+  已生效配置保持不变——不会出现部分生效。
+- 热更新无需重启：判定路径（上报/建连/补发）与配置更新共用同一把锁，
+  单条报文的判定要么完全用旧版本、要么完全用新版本；配置切换与并发上报、
+  补发同时进行时，不会出现同一批数据被新旧两套配置重复判定，补发顺序
+  （offset）不受配置切换影响。
+- 配置版本切换后，该设备（且仅该设备）的频率窗口在新版本下重新起算，
+  序列连续性（`last_seq`）保留。
+
+```bash
+# d1 覆盖：窗口配额放宽到 10（版本 2 必须大于 d1 链当前版本）
+curl -X POST localhost:8800/config -H 'content-type: application/json' -d '{
+  "updates": [{"device_id": "d1", "version": 2, "max_concurrent_sessions": 1,
+               "max_reports_per_window": 10, "window_ms": 60000}]}'
+curl localhost:8800/config/d1     # 查 d1 生效配置（含版本、是否覆盖）
+```
+
+### 判定台账与查询
+
+每个事件——上报判定（接受/重复/拒绝）、建连/断连、转发补发——都作为一条
+`DecisionRecord` 写入有界台账 `DecisionLedger`：
+
+```
+(seq_no, kind, device_id, decision, reason, config_version, received_at_ms, envelope, detail)
+```
+
+- `config_version` 是**事件发生时该设备生效的配置版本**，即判定依据；
+- `envelope` 保留原始报文，出处完整；
+- 台账容量固定（默认 10000），超出淘汰最旧记录，内存不会无限增长；
+- 补发流水（`kind=forward`）记录的是**受理时**的版本：已收下未转发的数据
+  在补发时不重新判定，配置后续变更不改变已受理数据的语义。
+
+```bash
+curl 'localhost:8800/decisions?device_id=d1&since_ms=1800000000000&kind=decision'
+```
+
+### 历史判定重放
+
+`audit.replay(records, registry, normalizer)` 把台账记录原样重放：
+
+1. 按 `seq_no` 升序取记录（补发流水不参与判定重放）；
+2. 每条记录生效的配置版本从 `ConfigRegistry` 的**版本历史**中取回
+   （每设备保留有界历史，默认 16 版），构造冻结视角的 `SessionManager`；
+3. 用相同的归一化器、容量不受限的缓存重放判定，逐条与当时结论对照。
+
+重放复现的是**配置敏感判定**（归一化、去重、序列、会话、配额）。
+`buffer_full` 由下游瞬时可用性驱动、不属于配置语义，重放时缓存容量不受限。
+配置版本历史或台账记录被淘汰后，对应区间无法忠实重放（`ReplayError`）——
+容量即追溯窗口的边界。
+
+### 兼容范围
+
+- **旧 API**：`SessionManager(QuotaPolicy(...))` 与 `update_policy` 仍然可用，
+  内部转为默认配置链上的版本化更新；既有 25 项测试全部保持通过。
+- **旧缓存数据**：引入版本标记前入缓存的记录 `config_version=0`，仅表示
+  "无版本信息"，不影响去重、补发顺序等既有语义；补发不重新判定，
+  旧数据按原样转发。
+- **旧配置下产生的判定**：只要对应版本还在版本历史内，就可按版本取回
+  当时配置重放复现；设备覆盖生效前的历史判定记的是默认链版本，
+  重放时自动回落默认链。
+
 ## 本地运行
 
 ```bash
@@ -117,12 +190,13 @@ curl localhost:8800/health            # buffered=0
 ```
 
 其他端点：`POST /flush`（触发补发）、`POST /ingest/{source}`、
-`GET /health`。
+`POST /config`（批量热更新配置）、`GET /config/{device_id}`（查生效配置）、
+`GET /decisions`（查判定台账）、`GET /health`。
 
 ## 验证方法
 
 ```bash
-uv run pytest -q                    # 25 项全部通过
+uv run pytest -q                    # 33 项全部通过
 uv run pytest --log-cli-level=INFO  # 打印每条用例的输入、判定依据与补发流水
 ```
 
@@ -136,6 +210,19 @@ uv run pytest --log-cli-level=INFO  # 打印每条用例的输入、判定依据
 - **配额冲突**：频率/并发超限拒绝原因可区分，且不影响其他设备；
 - **缓存耗尽**：`buffer_full` 明确拒绝，补发腾出空间后可重试成功；
 - **协议归一**：缺字段、坏时间戳、未知来源、多协议字段映射；
+- **按设备配置**：不同设备不同并发/频率上限，互不影响
+  （`test_per_device_differential_config`）；
+- **热更新**：更新前后同一设备判定对照，只影响目标设备
+  （`test_hot_update_changes_only_target_device`）；
+- **判定重放**：跨版本历史记录重放，结论与当时一致
+  （`test_replay_reproduces_historical_decisions`）；
+- **并发确定性**：配置切换与并发上报/补发并行，版本单调、不丢不重、补发有序
+  （`test_config_switch_concurrent_with_ingest_and_flush_is_deterministic`）；
+- **整批拒绝**：非法字段/版本不前进整批拒绝，原配置不变
+  （`test_invalid_or_regressing_batch_rejected_atomically`）；
+- **受理版本语义**：已受理数据补发按受理时版本入账
+  （`test_buffered_data_replayed_with_acceptance_version`）；
+- **台账有界**：容量固定，超出淘汰最旧（`test_ledger_capacity_is_bounded`）；
 - **HTTP 全链路**：TestClient 覆盖建连、上报、故障注入、自动补发、各类拒绝。
 
 日志样例（输入 → 判定 → 补发流水）：

@@ -26,10 +26,15 @@ class StoreResult(enum.Enum):
 
 @dataclass(frozen=True)
 class BufferedRecord:
-    """缓存记录：单调 offset 保证补发顺序确定。"""
+    """缓存记录：单调 offset 保证补发顺序确定。
+
+    config_version 记录受理时生效的配置版本：补发不再重新判定，
+    该版本随记录流转到补发流水，保证事后可追溯受理时的配置语义。
+    """
 
     offset: int
     point: TelemetryPoint
+    config_version: int = 0
 
 
 def _key(point: TelemetryPoint) -> tuple[str, str, int, float, int]:
@@ -62,15 +67,14 @@ class SpoolBuffer:
         k = _key(point)
         return k in self._pending_keys or k in self._acked_keys
 
-    def store(self, point: TelemetryPoint) -> StoreResult:
+    def store(self, point: TelemetryPoint, config_version: int = 0) -> StoreResult:
         k = _key(point)
-        if k in self._pending_keys or k in self._acked_keys:
-            return StoreResult.DUPLICATE
         if k in self._pending_keys or k in self._acked_keys:
             return StoreResult.DUPLICATE
         if len(self._records) >= self._capacity:
             return StoreResult.FULL
-        rec = BufferedRecord(offset=self._next_offset, point=point)
+        rec = BufferedRecord(offset=self._next_offset, point=point,
+                             config_version=config_version)
         self._next_offset += 1
         self._records.append(rec)
         self._pending_keys.add(k)
