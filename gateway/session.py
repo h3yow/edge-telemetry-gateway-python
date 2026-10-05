@@ -62,8 +62,13 @@ class SessionManager:
             s.window_start_ms = 0
             s.policy_version = policy.version
 
-    def open_connection(self, device_id: str) -> RejectReason | None:
-        """建立连接；超出并发配额返回 QUOTA_EXCEEDED。"""
+    def open_connection(self, device_id: str,
+                        policy: QuotaPolicy | None = None) -> RejectReason | None:
+        """建立连接；超出并发配额返回 QUOTA_EXCEEDED。
+
+        policy 为空用全局默认策略；传入则按该（按设备）策略判定并发上限。
+        """
+        effective = policy if policy is not None else self._policy
         s = self._sessions.get(device_id)
         if s is None:
             s = DeviceSession(
@@ -72,10 +77,10 @@ class SessionManager:
                 last_seq=-1,
                 window_start_ms=0,
                 window_count=0,
-                policy_version=self._policy.version,
+                policy_version=effective.version,
             )
             self._sessions[device_id] = s
-        if s.active_connections >= self._policy.max_concurrent_sessions_per_device:
+        if s.active_connections >= effective.max_concurrent_sessions_per_device:
             return RejectReason.QUOTA_EXCEEDED
         s.active_connections += 1
         return None
@@ -85,20 +90,32 @@ class SessionManager:
         if s is not None and s.active_connections > 0:
             s.active_connections -= 1
 
-    def check(self, point: TelemetryPoint) -> RejectReason | None:
-        """校验会话状态、序列连续性与频率配额；通过则推进会话状态，返回 None。"""
+    def check(self, point: TelemetryPoint,
+              policy: QuotaPolicy | None = None) -> RejectReason | None:
+        """校验会话状态、序列连续性与频率配额；通过则推进会话状态，返回 None。
+
+        policy 为空用全局默认策略；传入则按该（按设备）策略判定。策略版本与
+        会话记录版本不一致时，频率窗口在新版本下重新起算（last_seq 保留），
+        与 update_policy 的语义一致，但作用范围仅限该设备。
+        """
+        effective = policy if policy is not None else self._policy
         s = self._sessions.get(point.device_id)
         if s is None or s.active_connections <= 0:
             return RejectReason.SESSION_CONFLICT  # 无活跃会话的上报
         if point.seq <= s.last_seq:
             return RejectReason.SEQUENCE_REGRESSION
+        # 配置版本切换：该设备的频率窗口在新版本下重新起算，序列连续性保留
+        if s.policy_version != effective.version:
+            s.window_count = 0
+            s.window_start_ms = 0
+            s.policy_version = effective.version
         # 滑窗频率检查（按网关接收时刻）
-        if s.window_count == 0 or point.received_at_ms - s.window_start_ms >= self._policy.window_ms:
+        if s.window_count == 0 or point.received_at_ms - s.window_start_ms >= effective.window_ms:
             s.window_start_ms = point.received_at_ms
             s.window_count = 0
-        if s.window_count >= self._policy.max_reports_per_window:
+        if s.window_count >= effective.max_reports_per_window:
             return RejectReason.QUOTA_EXCEEDED
         s.window_count += 1
         s.last_seq = point.seq
-        s.policy_version = self._policy.version
+        s.policy_version = effective.version
         return None
